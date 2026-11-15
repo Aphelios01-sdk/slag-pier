@@ -17,6 +17,10 @@ import { createHud } from './hud.js';
 import { createAudio } from './audio.js';
 import { WEAPONS, DEFAULT_LOADOUT } from './weapons.js';
 import { mulberry32, dist2 } from './util.js';
+import { createBomb } from './bomb.js';
+import { createHearing } from './hearing.js';
+import { createGrenades } from './grenade.js';
+import { createPostfx } from './postfx.js';
 
 const FIXED_STEP = 1 / 60;
 const params = new URLSearchParams(window.location.search);
@@ -30,7 +34,8 @@ renderer.setSize(innerWidth, innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.05;
+renderer.toneMappingExposure = 1.12;
+renderer.shadowMap.type = THREE.PCFShadowMap;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 document.getElementById('game').appendChild(renderer.domElement);
 
@@ -49,7 +54,7 @@ const raycaster = new THREE.Raycaster();
 const tmpV = new THREE.Vector3();
 const tmpV2 = new THREE.Vector3();
 
-let world, player, bots;
+let world, player, bots, bomb, grenades, postfx;
 let loadout = structuredClone(DEFAULT_LOADOUT);
 let started = false;
 let frozen = false;
@@ -76,9 +81,14 @@ function onLock(locked) {
 async function boot() {
   world = await createWorld(scene);
   player = createPlayer(world.colliders);
-  bots = createBots(scene, world, random);
+  const hearing = createHearing();
+  window.__hearing = hearing;
+  bots = createBots(scene, world, random, hearing);
   gun.equip('spar_p9');
   loadout.secondary = 'spar_p9';
+  bomb = createBomb(scene, world.sites);
+  grenades = createGrenades(scene, effects, audio);
+  postfx = createPostfx(renderer, scene, camera);
 
   // charge prop
   try {
@@ -86,7 +96,18 @@ async function boot() {
     chargeMesh = await loadGlb('./assets/charge.glb');
     chargeMesh.visible = false;
     scene.add(chargeMesh);
-  } catch { /* optional */ }
+    bomb.attachCharge(chargeMesh);
+  } catch {
+    const g = new THREE.Group();
+    const mat = new THREE.MeshStandardMaterial({ color: 0x2ecc71, metalness: 0.45, roughness: 0.35, emissive: 0x0a4020, emissiveIntensity: 0.3 });
+    const a = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.11, 0.38, 12), mat);
+    a.position.set(-0.14, 0.2, 0); g.add(a);
+    const b = a.clone(); b.position.x = 0.14; g.add(b);
+    const pad = new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.12, 0.32), new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.6 }));
+    pad.position.y = 0.42; g.add(pad);
+    chargeMesh = g; scene.add(chargeMesh);
+    bomb.attachCharge(chargeMesh);
+  }
 
   buy.onPick((id) => {
     if (match.state.phase !== 'buy') return;
@@ -107,6 +128,7 @@ async function boot() {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
+    postfx?.resize(innerWidth, innerHeight);
   });
 
   window.addEventListener('keydown', (e) => {
@@ -176,6 +198,7 @@ function startRound() {
   gun.equip('spar_p9');
   bots.resetRound(match.state.attacker);
   if (chargeMesh) chargeMesh.visible = false;
+  bomb?.reset();
   match.startBuy();
   buy.setOpen(true);
   refreshBuy();
@@ -190,39 +213,10 @@ function throwNade(type) {
   nadeCooldown = 0.8;
   hud.setNades(loadout.nades, loadout.kit);
   camera.getWorldDirection(tmpV);
-  const origin = camera.getWorldPosition(tmpV2);
-  const land = origin.clone().addScaledVector(tmpV, 14);
-  land.y = 0;
-  if (type === 'smoke') effects.smokeCloud(land.x, land.z);
-  else if (type === 'flare') {
-    const look = tmpV.clone();
-    const blind = effects.flashBang(land.x, land.z, player.state.pos, look);
-    hud.setFlash(blind);
-    // blind bots roughly
-    for (const b of bots.bots) {
-      if (!b.alive) continue;
-      if (dist2(b.mesh.position.x, b.mesh.position.z, land.x, land.z) < 12) b.cooldown += 2.5;
-    }
-  } else if (type === 'frag') {
-    setTimeout(() => {
-      audio.explode();
-      effects.smokeCloud(land.x, land.z, 0x555045);
-      // damage nearby
-      if (player.state.alive && dist2(player.state.pos.x, player.state.pos.z, land.x, land.z) < 9) {
-        const d = 40 * (1 - dist2(player.state.pos.x, player.state.pos.z, land.x, land.z) / 9);
-        player.applyDamage(d, false);
-      }
-      for (const b of bots.bots) {
-        if (!b.alive) continue;
-        const d = dist2(b.mesh.position.x, b.mesh.position.z, land.x, land.z);
-        if (d < 9) {
-          const amount = 70 * (1 - d / 9);
-          const res = bots.applyDamage(b, amount, false);
-          if (res.killed) onKill(b.name, 'Frag', false, b.team);
-        }
-      }
-    }, 1400);
-  }
+  const origin = camera.getWorldPosition(new THREE.Vector3()).addScaledVector(tmpV, 0.6);
+  origin.y -= 0.15;
+  grenades.throwOne(type, origin, tmpV);
+  window.__hearing?.emit('nade', origin.x, origin.z, 18, player.state.team);
 }
 
 function hitTest(origin, dir, range) {
@@ -278,7 +272,34 @@ function sim(dt) {
   if (frozen) return;
   gun.update(dt);
   effects.update(dt);
+  window.__hearing?.update(dt);
+  grenades?.update(dt,
+    (x, z) => {
+      if (player.state.alive && dist2(player.state.pos.x, player.state.pos.z, x, z) < 9) {
+        player.applyDamage(55 * (1 - dist2(player.state.pos.x, player.state.pos.z, x, z) / 9), false);
+      }
+      for (const b of bots.bots) {
+        if (!b.alive) continue;
+        const d = dist2(b.mesh.position.x, b.mesh.position.z, x, z);
+        if (d < 9) {
+          const res = bots.applyDamage(b, 85 * (1 - d / 9), false);
+          if (res.killed) onKill(b.name, 'Frag', false, b.team);
+        }
+      }
+    },
+    (x, z) => {
+      const look = new THREE.Vector3();
+      camera.getWorldDirection(look);
+      hud.setFlash(effects.flashBang(x, z, player.state.pos, look));
+      for (const b of bots.bots) {
+        if (b.alive && dist2(b.mesh.position.x, b.mesh.position.z, x, z) < 12) b.cooldown += 2.8;
+      }
+    },
+    () => {},
+  );
   hud.update(dt);
+  const radio = bots?.radioLine?.();
+  if (radio) hud.setRadio(radio);
   nadeCooldown = Math.max(0, nadeCooldown - dt);
 
   if (!started) return;
@@ -328,32 +349,45 @@ function sim(dt) {
           hud.addKill(`${bot.name} [${def.name}] You`);
           hud.setRadio('RADIO You are down — spectating');
         }
-      });
+      }, bomb, match.state.attacker);
       checkElim();
 
-      // plant / defuse
+      // plant / defuse via bomb.js
       const holding = input.pressed('KeyE');
+      const isAtk = player.state.team === match.state.attacker;
       if (holding && player.state.alive) {
-        const pp = match.tryPlant(player.state, world.sites, dt, true);
+        const pp = bomb.tryPlant(player.state, dt, true, isAtk);
         if (pp === 1) {
           audio.plant();
-          hud.setRadio(`RADIO Charge planted at ${world.sites[match.state.bomb.site].name}`);
-          if (chargeMesh) {
-            const s = world.sites[match.state.bomb.site];
-            chargeMesh.position.set(s.x, 0.25, s.z);
-            chargeMesh.visible = true;
-          }
-        } else if (pp > 0) hud.setProgress('Arming the charge', pp);
+          match.state.phase = 'bomb';
+          hud.setRadio(`RADIO Charge planted — SITE ${bomb.state.site} (${world.sites[bomb.state.site].name} PLANT ZONE)`);
+        } else if (pp > 0) hud.setProgress(`Arming charge — SITE ${bomb.nearSite(player.state.pos) || ''} PLANT ZONE`, pp);
         else {
-          const dp = match.tryDefuse(player.state, world.sites, dt, true, loadout.kit);
-          if (dp === 1) { audio.defuse(); hud.setRadio('RADIO Charge defused'); }
-          else if (dp > 0) hud.setProgress('Defusing', dp);
+          const dp = bomb.tryDefuse(player.state, dt, true, !isAtk, loadout.kit);
+          if (dp === 1) {
+            audio.defuse();
+            match.award(player.state.team, 'Bomb defused');
+            bomb.reset();
+            hud.setRadio('RADIO Charge defused — round secured');
+          } else if (dp > 0) hud.setProgress('Defusing charge', dp);
           else hud.setProgress('', 0);
         }
       } else {
-        match.state.bomb.planting = 0;
-        match.state.bomb.defuse = 0;
+        bomb.state.planting = 0;
+        bomb.state.defusing = 0;
         hud.setProgress('', 0);
+      }
+      const boom = bomb.tick(dt);
+      if (boom === 'explode') {
+        audio.explode();
+        match.award(match.state.attacker, 'Bomb detonated');
+        bomb.reset();
+      }
+      if (bomb.state.planted) {
+        match.state.phase = 'bomb';
+        match.state.time = bomb.state.timer;
+        // keep match.bomb.planted false so match.update does not double-tick the fuse
+        match.state.bomb.site = bomb.state.site;
       }
 
       // fire
@@ -363,6 +397,7 @@ function sim(dt) {
         if (gun.def.auto || edge) {
           const result = gun.fire(camera, player.moving(), player.state.crouch, hitTest);
           processPlayerShot(result);
+          if (result) window.__hearing?.emit('gun', player.state.pos.x, player.state.pos.z, 28, player.state.team);
         }
       } else {
         fireHeld = false;
@@ -405,6 +440,7 @@ function respawnForBuy() {
   activeSlot = 'secondary';
   bots.resetRound(match.state.attacker);
   if (chargeMesh) chargeMesh.visible = false;
+  bomb?.reset();
   buy.setOpen(true);
   refreshBuy();
   hud.showScoreboard(false);
@@ -459,47 +495,46 @@ async function setupShot() {
   } else if (shot === 'play') {
     match.state.phase = 'live';
     match.state.time = 82;
-    player.spawnAt({ x: -14, z: -6, yaw: Math.PI + 0.35 }, 'ash');
-    player.state.pitch = -0.04;
+    // Look into Hopper SITE A plant zone with enemies + smoke + cover
+    player.spawnAt({ x: -14, z: -7, yaw: Math.PI + 0.15 }, 'ash');
+    player.state.pitch = -0.05;
     camera.position.copy(player.state.pos);
     camera.rotation.order = 'YXZ';
     camera.rotation.y = player.state.yaw;
     camera.rotation.x = player.state.pitch;
     const enemy = bots.bots.find((b) => b.team === 'coil');
     if (enemy) {
-      enemy.mesh.position.set(-18, 0, -16);
-      enemy.mesh.rotation.y = 0.5;
+      enemy.mesh.position.set(-18, 0, -15.5);
+      enemy.mesh.rotation.y = 0.3;
       enemy.mesh.visible = true;
     }
     const enemy2 = bots.bots.filter((b) => b.team === 'coil')[1];
-    if (enemy2) { enemy2.mesh.position.set(-10, 0, -14); enemy2.mesh.rotation.y = -0.4; }
-    effects.smokeCloud(-22, -10);
+    if (enemy2) { enemy2.mesh.position.set(-15, 0, -18); enemy2.mesh.rotation.y = -0.2; }
+    const ally = bots.bots.find((b) => b.team === 'ash');
+    if (ally) { ally.mesh.position.set(-10, 0, -11); ally.mesh.rotation.y = Math.PI; }
+    effects.smokeCloud(-24, -18);
     hud.addKill('Flint [Gadfly SMG] Reef');
-    hud.setRadio('RADIO Contact at Hopper, rotating.');
+    hud.setRadio('RADIO Flint: Contact at Hopper SITE A, rotating.');
     await viewmodel.setWeapon('tern_ar');
-    camera.getWorldPosition(tmpV);
-    camera.getWorldDirection(tmpV2);
-    effects.muzzle(tmpV.clone().addScaledVector(tmpV2, 0.9));
-    const enemyHit = tmpV.clone().addScaledVector(tmpV2, 16);
-    effects.tracer(tmpV.clone().addScaledVector(tmpV2, 0.9), enemyHit, 0xffe0a0);
   } else if (shot === 'plant') {
     match.state.phase = 'bomb';
     match.state.time = 35;
-    match.state.bomb.planted = true;
-    match.state.bomb.site = 'B';
-    match.state.bomb.timer = 35;
-    player.spawnAt({ x: 20, z: 12.2, yaw: 0 }, 'ash');
-    player.state.pitch = -0.55;
-    camera.position.set(20, 1.55, 12.2);
+    bomb.state.planted = true;
+    bomb.state.site = 'B';
+    bomb.state.timer = 35;
+    player.spawnAt({ x: 20, z: 11.8, yaw: 0 }, 'ash');
+    player.state.pitch = -0.48;
+    camera.position.set(20, 1.65, 11.8);
     camera.rotation.order = 'YXZ';
     camera.rotation.y = 0;
-    camera.rotation.x = -0.55;
+    camera.rotation.x = -0.48;
     if (chargeMesh) {
-      chargeMesh.position.set(20, 0.35, 14);
+      chargeMesh.position.set(20, 0.4, 14);
       chargeMesh.visible = true;
-      chargeMesh.scale.setScalar(2.0);
+      chargeMesh.scale.setScalar(2.4);
     }
-    hud.setProgress('Arming the charge', 0.42);
+    hud.setProgress('SITE B DOCK — Arming the charge', 0.55);
+    hud.setRadio('RADIO SITE B IS THE TARGET — hold the plant zone');
     gun.equip('breach12');
     await viewmodel.setWeapon('breach12');
   } else {
@@ -525,40 +560,36 @@ async function setupShot() {
   for (let i = 0; i < 3; i++) sim(FIXED_STEP);
   // Re-assert shot framing after sim (sim can move camera / clear progress)
   if (shot === 'play') {
+    player.spawnAt({ x: -14, z: -7, yaw: Math.PI + 0.15 }, 'ash');
+    player.state.pitch = -0.05;
     await viewmodel.setWeapon('tern_ar');
     gun.equip('tern_ar');
+    const enemy = bots.bots.find((b) => b.team === 'coil');
+    if (enemy) { enemy.mesh.position.set(-18, 0, -15); enemy.mesh.visible = true; }
+    camera.position.copy(player.state.pos);
+    camera.rotation.order = 'YXZ';
+    camera.rotation.y = player.state.yaw;
+    camera.rotation.x = player.state.pitch;
     camera.getWorldPosition(tmpV);
     camera.getWorldDirection(tmpV2);
-    effects.muzzle(tmpV.clone().addScaledVector(tmpV2, 0.85));
-    effects.tracer(tmpV.clone().addScaledVector(tmpV2, 0.85), tmpV.clone().addScaledVector(tmpV2, 18), 0xffe0a0);
+    effects.tracer(tmpV.clone().addScaledVector(tmpV2, 1.2), tmpV.clone().addScaledVector(tmpV2, 16), 0xffe0a0);
+    hud.setRadio('RADIO Flint: Contact at Hopper SITE A, rotating.');
   }
   if (shot === 'plant') {
-    camera.position.set(20, 1.6, 12.0);
+    camera.position.set(18.5, 1.85, 11.2);
     camera.rotation.order = 'YXZ';
-    camera.rotation.y = 0;
-    camera.rotation.x = -0.62;
-    if (!chargeMesh) {
-      const { loadGlb } = await import('./world.js');
-      try {
-        chargeMesh = await loadGlb('./assets/charge.glb');
-        scene.add(chargeMesh);
-      } catch {
-        chargeMesh = new THREE.Group();
-        const mat = new THREE.MeshStandardMaterial({ color: 0x2ecc71, metalness: 0.4, roughness: 0.35 });
-        const a = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.4, 12), mat);
-        a.position.set(-0.14, 0.2, 0); chargeMesh.add(a);
-        const b = a.clone(); b.position.x = 0.14; chargeMesh.add(b);
-        const pad = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.12, 0.3), new THREE.MeshStandardMaterial({ color: 0x111111 }));
-        pad.position.y = 0.42; chargeMesh.add(pad);
-        scene.add(chargeMesh);
-      }
+    camera.rotation.y = -0.25;
+    camera.rotation.x = -0.28;
+    if (chargeMesh) {
+      chargeMesh.position.set(20, 0.42, 14);
+      chargeMesh.visible = true;
+      chargeMesh.scale.setScalar(2.5);
     }
-    chargeMesh.position.set(20, 0.4, 14);
-    chargeMesh.visible = true;
-    chargeMesh.scale.setScalar(2.2);
+    bomb.state.planted = true; bomb.state.site = 'B'; bomb.state.timer = 35;
     await viewmodel.setWeapon('breach12');
     gun.equip('breach12');
-    hud.setProgress('Arming the charge — hold E', 0.45);
+    hud.setProgress('SITE B / PLANT ZONE — Arming the charge', 0.58);
+    hud.setRadio('RADIO SITE B IS THE TARGET');
   }
   if (shot === 'start') {
     buy.setOpen(true);
@@ -591,7 +622,7 @@ function frame(now) {
   } else {
     hud.setMinimap(player.state, bots.bots, world.sites, match.state.bomb);
   }
-  renderer.render(scene, camera);
+  if (postfx) postfx.render(); else renderer.render(scene, camera);
   if (shot && frozen) {
     shotReadyFrames += 1;
     if (shotReadyFrames > 2) window.__shotReady = true;

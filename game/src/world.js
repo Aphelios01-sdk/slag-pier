@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 import { GLTFLoader } from '../vendor/three/examples/jsm/loaders/GLTFLoader.js';
+import { createMaterials } from './materials.js';
 
 const loader = new GLTFLoader();
 const glbCache = new Map();
@@ -91,7 +92,7 @@ export async function createWorld(scene) {
   );
   scene.add(sky);
   scene.background = new THREE.Color(PALETTE.skyHorizon);
-  scene.fog = new THREE.Fog(PALETTE.fog, 28, 78);
+  scene.fog = new THREE.Fog(PALETTE.fog, 42, 95);
   const hemi = new THREE.HemisphereLight(PALETTE.skyTop, PALETTE.shadow, 0.65);
   scene.add(hemi);
   const sun = new THREE.DirectionalLight(0xffe0b0, 1.7);
@@ -112,60 +113,83 @@ export async function createWorld(scene) {
   scene.add(fill);
 
   // Ground slabs — unique pier layout: long pier spine, hopper courtyard west, dock east
-  const groundTex = makeNoiseTexture(256, 256, [90, 62, 40], [120, 85, 55], 1.4);
-  groundTex.repeat.set(18, 14);
-  const ground = new THREE.Mesh(
-    new THREE.BoxGeometry(72, 0.4, 56),
-    new THREE.MeshStandardMaterial({ map: groundTex, roughness: 0.92, metalness: 0.04 }),
-  );
+  const ground = new THREE.Mesh(new THREE.BoxGeometry(72, 0.4, 56), new THREE.MeshStandardMaterial({ color: 0x6b4a32, roughness: 0.92 }));
   ground.position.set(0, -0.2, 0);
   ground.receiveShadow = true;
   scene.add(ground);
 
-  // Cobble / tile patches for sites
-  const tileA = boxMesh(8, 0.05, 8, PALETTE.groundAlt, { roughness: 0.85 });
-  tileA.position.set(sites.A.x, 0.02, sites.A.z);
-  scene.add(tileA);
-  const tileB = boxMesh(9, 0.05, 7, 0x3a6a62, { roughness: 0.8 });
-  tileB.position.set(sites.B.x, 0.02, sites.B.z);
-  scene.add(tileB);
 
-  function wall(x, z, w, d, h, color = PALETTE.concrete) {
-    const m = boxMesh(w, h, d, color, { roughness: 0.78, metalness: 0.05 });
+  // Cobble / tile patches for sites
+  // Site pads — replaced after mats init
+  let tileA, tileB;
+
+  const mats = createMaterials();
+  if (typeof ground !== "undefined" && ground) ground.material = mats.gravel;
+
+  function wall(x, z, w, d, h, mat = mats.concrete) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    m.castShadow = true; m.receiveShadow = true;
     m.position.set(x, h / 2, z);
     scene.add(m);
     addCollider(colliders, x, z, w, d, 0, h);
     shootables.push(m);
     return m;
   }
-  function low(x, z, w, d, h = 1.1, color = PALETTE.concreteDark) {
-    const m = wall(x, z, w, d, h, color);
+  function low(x, z, w, d, h = 1.15, mat = mats.concreteDark) {
+    const m = wall(x, z, w, d, h, mat);
     coverNodes.push({ x, z, w, d });
     return m;
   }
+  function hazardStrip(x, z, w, d, rot = 0) {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, 0.04, d), mats.hazard);
+    m.position.set(x, 0.03, z);
+    m.rotation.y = rot;
+    m.receiveShadow = true;
+    scene.add(m);
+    return m;
+  }
+
+  tileA = new THREE.Mesh(new THREE.BoxGeometry(9, 0.06, 9), mats.tileA);
+  tileA.position.set(sites.A.x, 0.03, sites.A.z); tileA.receiveShadow = true; scene.add(tileA);
+  tileB = new THREE.Mesh(new THREE.BoxGeometry(10, 0.06, 8), mats.tileB);
+  tileB.position.set(sites.B.x, 0.03, sites.B.z); tileB.receiveShadow = true; scene.add(tileB);
+
+  // Extra cover stacks + hazard lane paint for readable sightlines
+  low(-16, -6, 2.2, 1.2, 1.3, mats.concreteDark);
+  low(-8, -2, 3.0, 1.1, 1.2, mats.concreteDark);
+  low(6, -2, 2.4, 1.2, 1.25, mats.metal);
+  low(18, 6, 2.6, 1.1, 1.2, mats.concreteDark);
+  low(-2, 8, 1.4, 3.2, 1.4, mats.brick);
+  low(10, 16, 3.5, 1.2, 1.15, mats.concreteDark);
+  wall(-14, 6, 1.2, 8, 3.2, mats.brick);
+  wall(8, -16, 8, 1.2, 3.0, mats.concrete);
+  hazardStrip(-18, -12.5, 6, 0.7);
+  hazardStrip(20, 11.2, 7, 0.7);
+  hazardStrip(2, 4, 0.7, 10);
+  hazardStrip(-6, -16, 8, 0.55);
 
   // Perimeter shells
-  wall(0, -28, 72, 1.2, 5, PALETTE.brick);
-  wall(0, 28, 72, 1.2, 4.5, PALETTE.brick);
-  wall(-36, 0, 1.2, 56, 5, PALETTE.concrete);
-  wall(36, 0, 1.2, 56, 5, PALETTE.concrete);
+  wall(0, -28, 72, 1.2, 5, mats.brick);
+  wall(0, 28, 72, 1.2, 4.5, mats.brick);
+  wall(-36, 0, 1.2, 56, 5, mats.concrete);
+  wall(36, 0, 1.2, 56, 5, mats.concrete);
 
   // Mid buildings — create lanes (T-junction + pier catwalk), NOT a Dust2 clone
-  wall(-10, -8, 14, 3.5, 4.2, PALETTE.concrete);
-  wall(-22, 2, 3.5, 16, 4.0, PALETTE.brick);
-  wall(6, 6, 12, 3.2, 3.8, PALETTE.concreteDark);
-  wall(14, -10, 3.2, 14, 4.5, PALETTE.concrete);
-  wall(-4, 14, 10, 3, 3.5, PALETTE.brick);
+  wall(-10, -8, 14, 3.5, 4.2, mats.concrete);
+  wall(-22, 2, 3.5, 16, 4.0, mats.brick);
+  wall(6, 6, 12, 3.2, 3.8, mats.concreteDark);
+  wall(14, -10, 3.2, 14, 4.5, mats.concrete);
+  wall(-4, 14, 10, 3, 3.5, mats.brick);
 
   // Hopper hall Site A enclosure
-  wall(-18, -22, 16, 1.4, 4.2, PALETTE.concrete);
-  wall(-26, -16, 1.4, 12, 4.2, PALETTE.concrete);
-  wall(-10, -16, 1.4, 8, 3.2, PALETTE.concreteDark);
+  wall(-18, -22, 16, 1.4, 4.2, mats.concrete);
+  wall(-26, -16, 1.4, 12, 4.2, mats.concrete);
+  wall(-10, -16, 1.4, 8, 3.2, mats.concreteDark);
   low(-18, -13, 4, 1.2, 1.2);
 
   // Dock Site B — open pier with containers
-  wall(26, 18, 12, 1.4, 3.5, PALETTE.metal);
-  wall(28, 10, 1.4, 10, 3.5, PALETTE.metalLight);
+  wall(26, 18, 12, 1.4, 3.5, mats.metal);
+  wall(28, 10, 1.4, 10, 3.5, mats.metal);
   low(16, 14, 3, 1.2, 1.15);
 
   // Catwalk spine down the pier center

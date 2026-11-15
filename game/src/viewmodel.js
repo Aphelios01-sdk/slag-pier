@@ -50,7 +50,7 @@ function buildGun(kind) {
 
 export function createViewmodel(camera) {
   const root = new THREE.Group();
-  root.position.set(0.28, -0.26, -0.48);
+  root.position.set(0.22, -0.22, -0.42);
   camera.add(root);
   let kick = 0;
   let sway = 0;
@@ -70,8 +70,8 @@ export function createViewmodel(camera) {
   function update(dt, moving) {
     sway += dt * (moving ? 10 : 3.2);
     const bob = moving ? Math.sin(sway) * 0.01 : 0;
-    root.position.x = 0.28 + bob;
-    root.position.y = -0.26 + Math.abs(Math.sin(sway * 0.5)) * (moving ? 0.008 : 0) + kick;
+    root.position.x = 0.22 + bob;
+    root.position.y = -0.22 + Math.abs(Math.sin(sway * 0.5)) * (moving ? 0.008 : 0) + kick;
     root.rotation.x = kick * 0.7;
     kick = Math.max(0, kick - dt * 0.55);
   }
