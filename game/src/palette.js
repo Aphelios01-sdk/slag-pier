@@ -21,3 +21,5 @@ export const PALETTE = {
   charge: 0x2ecc71,
   shadow: 0x1a1008,
 };
+
+// palette locked for slag sunset look
